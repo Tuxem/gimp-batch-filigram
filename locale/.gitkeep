@@ -1,0 +1,13 @@
+# Dossier réservé aux catalogues de traduction (gettext).
+#
+# La version 1.0.0 du plugin n'active pas la traduction (les chaînes de
+# l'interface sont en français). Ce dossier est prévu pour accueillir de
+# futurs catalogues au format :
+#
+#   locale/<code_langue>/LC_MESSAGES/watermark-exporter.mo
+#
+# Pour activer l'internationalisation :
+#   1. extraire les chaînes marquées par la fonction `_()` (via xgettext) ;
+#   2. produire les fichiers .po/.mo ;
+#   3. faire renvoyer à `do_set_i18n()` le domaine et ce dossier, et remplacer
+#      la fonction `_()` de `lib/ui.py` par un appel à GLib.dgettext.

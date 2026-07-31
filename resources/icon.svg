@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg"
+     role="img" aria-label="Watermark Exporter">
+  <!-- Icône du plugin : une pile de photos avec un filigrane « W ». -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#1e40af"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Fond arrondi. -->
+  <rect x="4" y="4" width="120" height="120" rx="22" fill="url(#bg)"/>
+
+  <!-- Pile de photos (deux feuilles en arrière-plan). -->
+  <rect x="30" y="24" width="64" height="64" rx="6" fill="#ffffff" opacity="0.35"
+        transform="rotate(-8 62 56)"/>
+  <rect x="34" y="30" width="64" height="64" rx="6" fill="#ffffff" opacity="0.6"
+        transform="rotate(-3 66 62)"/>
+
+  <!-- Photo au premier plan. -->
+  <rect x="38" y="36" width="66" height="66" rx="6" fill="#ffffff"/>
+  <!-- « Paysage » stylisé dans la photo. -->
+  <circle cx="58" cy="56" r="7" fill="#fbbf24"/>
+  <path d="M44 92 L64 68 L78 84 L88 74 L98 92 Z" fill="#60a5fa"/>
+
+  <!-- Filigrane semi-transparent « W » superposé. -->
+  <text x="71" y="86" font-family="Arial, Helvetica, sans-serif" font-size="46"
+        font-weight="700" text-anchor="middle" fill="#1e3a8a" opacity="0.35">W</text>
+
+  <!-- Flèche d'export. -->
+  <g fill="#ffffff">
+    <circle cx="98" cy="98" r="20" fill="#16a34a"/>
+    <path d="M98 88 L106 98 L100 98 L100 108 L96 108 L96 98 L90 98 Z"/>
+  </g>
+</svg>
