@@ -16,8 +16,25 @@ Cette interface :
 
 * collecte tous les réglages du filigrane et de l'export ;
 * valide les saisies avant de lancer le traitement ;
-* affiche une barre de progression et un journal des résultats sans figer
-  l'interface (la boucle GTK est pompée entre chaque image).
+* affiche une barre de progression et un journal des résultats **sans jamais
+  figer l'interface**.
+
+.. important:: **Pourquoi l'export n'est pas lancé d'un seul bloc**
+
+   Traiter tout le lot à l'intérieur du gestionnaire de signal ``response``
+   monopolise la boucle principale GTK pendant toute la durée du lot. La
+   fenêtre ne répond alors plus aux requêtes du gestionnaire de fenêtres
+   (``_NET_WM_PING``), qui la déclare « ne répond pas » et propose de la tuer —
+   alors même que l'export se déroule correctement. Pomper la file d'événements
+   entre deux images ne suffit pas : une seule grande image (filigrane, fusion,
+   puis compression PNG) dépasse largement le délai de grâce du gestionnaire de
+   fenêtres.
+
+   L'export est donc découpé : le moteur expose un **générateur** (une image par
+   itération) que cette fenêtre fait avancer depuis la boucle GTK elle-même
+   (``GLib.timeout_add``). Entre deux images, la boucle reprend la main
+   normalement ; à l'intérieur d'une image, les rappels d'étape pompent la file
+   d'événements. La fenêtre reste vivante, l'annulation devient possible.
 
 L'interface est **découplée** du moteur d'export : elle reçoit un *export
 runner* (callable) en injection de dépendance, ce qui facilite les tests et
@@ -26,7 +43,7 @@ respecte l'inversion de dépendance.
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+from typing import Callable, Iterator, List, Optional
 
 import gi
 
@@ -34,7 +51,7 @@ gi.require_version("Gimp", "3.0")
 gi.require_version("GimpUi", "3.0")
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gimp, GimpUi, Gtk  # noqa: E402
+from gi.repository import Gdk, Gimp, GimpUi, GLib, Gtk  # noqa: E402
 
 from . import constants as C  # noqa: E402
 from . import utils  # noqa: E402
@@ -56,8 +73,14 @@ def _(message: str) -> str:
     return message
 
 
-#: Signature d'un exécuteur d'export injecté dans le dialogue.
-ExportRunner = Callable[[Settings, Callable[[int, int, str, str], None]], list]
+#: Signature d'un exécuteur d'export injecté dans le dialogue. Il reçoit les
+#: préférences, un rappel de progression ``(index, total, nom, statut)`` et un
+#: rappel d'étape ``(libellé)``, et retourne un **itérateur** produisant un
+#: résultat par image (voir :meth:`lib.exporter.BatchExporter.iter_export`).
+ExportRunner = Callable[
+    [Settings, Callable[[int, int, str, str], None], Callable[[str], None]],
+    Iterator,
+]
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +126,10 @@ class WatermarkDialog:
         self._export_runner = export_runner
         self._image_count = image_count
         self._running = False
+        self._cancel_requested = False
+        self._export_iter: Optional[Iterator] = None
+        self._results: List = []
+        self._step_source: int = 0
 
         self.dialog: Gtk.Dialog = GimpUi.Dialog(
             title=C.PLUGIN_TITLE,
@@ -316,6 +343,27 @@ class WatermarkDialog:
         opt_grid.attach(self._debug_check, 0, 1, 2, 1)
         page.pack_start(opt_frame, False, False, 0)
 
+        # --- Charge machine ---
+        load_frame, load_grid = self._make_frame(_("Charge machine"))
+        self._limit_cpu_check = Gtk.CheckButton(
+            label=_("Brider le traitement (laisser des cœurs libres)"))
+        self._limit_cpu_check.set_tooltip_text(
+            _("Réduit le nombre de threads utilisés par le moteur de GIMP "
+              "pendant l'export : le poste reste utilisable, au prix d'un "
+              "export un peu plus long."))
+        self._limit_cpu_check.connect("toggled", lambda *_a: self._update_sensitivity())
+        load_grid.attach(self._limit_cpu_check, 0, 0, 2, 1)
+
+        self._cpu_reserve_spin = Gtk.SpinButton.new_with_range(0, C.CPU_RESERVE_MAX, 1)
+        self._attach_row(load_grid, 1, _("Cœurs laissés libres :"), self._cpu_reserve_spin)
+
+        self._throttle_spin = Gtk.SpinButton.new_with_range(0, C.THROTTLE_MS_MAX, 10)
+        self._throttle_spin.set_tooltip_text(
+            _("Temps rendu au système entre deux images. Augmentez cette valeur "
+              "si la machine reste trop chargée pendant les gros lots."))
+        self._attach_row(load_grid, 2, _("Pause entre images (ms) :"), self._throttle_spin)
+        page.pack_start(load_frame, False, False, 0)
+
         return self._wrap_scroll(page)
 
     # ------------------------------------------------------------------ #
@@ -407,6 +455,9 @@ class WatermarkDialog:
         self._overwrite_check.set_active(s.overwrite)
         self._skip_check.set_active(s.skip_unmodified)
         self._debug_check.set_active(s.debug)
+        self._limit_cpu_check.set_active(s.limit_cpu)
+        self._cpu_reserve_spin.set_value(s.cpu_reserve)
+        self._throttle_spin.set_value(s.throttle_ms)
 
     def _read_widgets_into_settings(self) -> None:
         """Recopie les valeurs des widgets vers les préférences."""
@@ -451,6 +502,9 @@ class WatermarkDialog:
         s.overwrite = self._overwrite_check.get_active()
         s.skip_unmodified = self._skip_check.get_active()
         s.debug = self._debug_check.get_active()
+        s.limit_cpu = self._limit_cpu_check.get_active()
+        s.cpu_reserve = self._cpu_reserve_spin.get_value_as_int()
+        s.throttle_ms = self._throttle_spin.get_value_as_int()
 
     @staticmethod
     def _parse_font(font_string: Optional[str]) -> str:
@@ -490,13 +544,16 @@ class WatermarkDialog:
         is_custom_name = self._naming_combo.get_active_id() == NamingMode.CUSTOM.value
         self._pattern_entry.set_sensitive(is_custom_name)
 
+        self._cpu_reserve_spin.set_sensitive(self._limit_cpu_check.get_active())
+
     # ------------------------------------------------------------------ #
     # Boucle d'exécution
     # ------------------------------------------------------------------ #
     def run(self) -> None:
         """Affiche la fenêtre et bloque jusqu'à sa fermeture."""
         self.dialog.connect("response", self._on_response)
-        self.dialog.connect("destroy", lambda *_a: Gtk.main_quit())
+        self.dialog.connect("delete-event", self._on_delete_event)
+        self.dialog.connect("destroy", self._on_destroy)
         self.dialog.show_all()
         self._update_sensitivity()
         Gtk.main()
@@ -506,11 +563,37 @@ class WatermarkDialog:
         if response == Gtk.ResponseType.OK:
             if not self._running:
                 self._on_export_clicked()
+        elif self._running:
+            # Pendant un export, « Annuler » interrompt le lot au lieu de fermer
+            # la fenêtre : l'image en cours va jusqu'au bout, les suivantes sont
+            # abandonnées, et le résumé est affiché normalement.
+            self._request_cancel()
         else:
             self.dialog.destroy()
 
+    def _on_delete_event(self, *_args) -> bool:
+        """Empêche la fermeture pendant un export (demande l'annulation à la place)."""
+        if self._running:
+            self._request_cancel()
+            return True  # Consomme l'événement : la fenêtre reste ouverte.
+        return False
+
+    def _on_destroy(self, *_args) -> None:
+        """Libère l'export en cours puis quitte la boucle GTK."""
+        self._stop_export()
+        Gtk.main_quit()
+
+    def _request_cancel(self) -> None:
+        """Marque le lot comme annulé (prise en compte après l'image en cours)."""
+        if self._cancel_requested:
+            return
+        self._cancel_requested = True
+        _log.info("Annulation de l'export demandée par l'utilisateur.")
+        self._progress_bar.set_text(_("Annulation en cours…"))
+        self._append_log(_("Annulation demandée — fin de l'image en cours…"))
+
     def _on_export_clicked(self) -> None:
-        """Valide, persiste puis lance l'export en tenant l'UI à jour."""
+        """Valide, persiste puis démarre l'export piloté par la boucle GTK."""
         self._read_widgets_into_settings()
 
         errors = utils.validate_export_parameters(
@@ -532,29 +615,102 @@ class WatermarkDialog:
         self._manager.save(self._settings)
 
         self._running = True
+        self._cancel_requested = False
+        self._results = []
         self._export_button.set_sensitive(False)
         self._log_buffer.set_text("")
         self._progress_bar.set_fraction(0.0)
+        self._progress_bar.set_text(_("Préparation…"))
 
         try:
-            results = self._export_runner(self._settings, self._on_progress)
+            self._export_iter = iter(self._export_runner(
+                self._settings, self._on_progress, self._on_stage))
+        except Exception as exc:  # noqa: BLE001 - l'UI ne doit jamais planter.
+            _log.exception("Erreur inattendue au démarrage de l'export")
+            self._show_message(Gtk.MessageType.ERROR, _("Erreur"), str(exc))
+            # Pas de résumé : l'erreur vient d'être affichée, rien n'a été traité.
+            self._finish_export(summary=False)
+            return
+
+        self._schedule_next_step()
+
+    # -- Pilotage pas à pas depuis la boucle GTK --------------------------
+    def _schedule_next_step(self) -> None:
+        """Programme le traitement de l'image suivante dans la boucle GTK.
+
+        La pause configurée (``throttle_ms``) sert à deux choses : rendre la
+        main à GTK — donc au gestionnaire de fenêtres — et laisser respirer le
+        système entre deux images d'un gros lot.
+        """
+        delay = max(0, self._settings.throttle_ms)
+        self._step_source = GLib.timeout_add(delay, self._export_step)
+
+    def _export_step(self) -> bool:
+        """Traite **une** image puis reprogramme la suivante.
+
+        :return: toujours ``False`` — chaque source GTK ne s'exécute qu'une
+            fois, la suivante étant réarmée explicitement.
+        """
+        self._step_source = 0
+
+        if self._cancel_requested:
+            self._finish_export(cancelled=True)
+            return False
+
+        try:
+            result = next(self._export_iter)  # type: ignore[arg-type]
+        except StopIteration:
+            self._finish_export()
+            return False
         except Exception as exc:  # noqa: BLE001 - l'UI ne doit jamais planter.
             _log.exception("Erreur inattendue pendant l'export")
             self._show_message(Gtk.MessageType.ERROR, _("Erreur"), str(exc))
-            results = []
-        finally:
-            self._running = False
-            self._export_button.set_sensitive(True)
+            self._finish_export()
+            return False
 
-        self._show_summary(results)
+        self._results.append(result)
+        self._schedule_next_step()
+        return False
 
+    def _stop_export(self) -> None:
+        """Arrête l'itérateur d'export et désarme la source GTK en attente."""
+        if self._step_source:
+            GLib.source_remove(self._step_source)
+            self._step_source = 0
+        if self._export_iter is not None:
+            close = getattr(self._export_iter, "close", None)
+            if callable(close):
+                # Referme le générateur : ses blocs ``finally`` s'exécutent
+                # (fin de la barre GIMP, restauration de la charge GEGL).
+                close()
+            self._export_iter = None
+
+    def _finish_export(self, cancelled: bool = False, summary: bool = True) -> None:
+        """Clôture l'export : nettoyage, réactivation des boutons, résumé."""
+        self._stop_export()
+        self._running = False
+        self._cancel_requested = False
+        self._export_button.set_sensitive(True)
+        if summary:
+            self._show_summary(self._results, cancelled=cancelled)
+
+    # -- Rappels du moteur d'export ---------------------------------------
     def _on_progress(self, index: int, total: int, name: str, status: str) -> None:
-        """Rappel de progression : met à jour la barre sans figer l'UI."""
+        """Rappel de progression : met à jour la barre et le journal."""
         fraction = index / total if total else 1.0
         self._progress_bar.set_fraction(fraction)
         self._progress_bar.set_text(f"{index}/{total} — {name}")
         self._append_log(f"[{status}] {name}")
-        # Pompe la file d'événements GTK pour garder l'interface réactive.
+
+    def _on_stage(self, label: str) -> None:
+        """Rappel d'étape : pompe la file d'événements au milieu d'une image.
+
+        Sans cela, une image lourde bloquerait la boucle GTK de bout en bout et
+        le gestionnaire de fenêtres déclarerait la fenêtre « ne répond pas ».
+        """
+        total = self._image_count
+        current = min(len(self._results) + 1, total) if total else 0
+        self._progress_bar.set_text(f"{current}/{total} — {label}")
         while Gtk.events_pending():
             Gtk.main_iteration()
 
@@ -566,21 +722,33 @@ class WatermarkDialog:
         end = self._log_buffer.get_end_iter()
         self._log_buffer.insert(end, line + "\n")
 
-    def _show_summary(self, results: List) -> None:
-        """Affiche un résumé de fin d'export."""
+    def _show_summary(self, results: List, cancelled: bool = False) -> None:
+        """Affiche un résumé de fin d'export.
+
+        :param results: résultats des images effectivement traitées.
+        :param cancelled: ``True`` si l'utilisateur a interrompu le lot.
+        """
         total = len(results)
         failed = [r for r in results if not r.success]
         succeeded = total - len(failed)
 
-        self._progress_bar.set_fraction(1.0)
-        self._progress_bar.set_text(_("Terminé"))
+        if cancelled:
+            self._progress_bar.set_text(_("Annulé"))
+        else:
+            self._progress_bar.set_fraction(1.0)
+            self._progress_bar.set_text(_("Terminé"))
 
         if not total:
-            message = _("Aucune image à traiter.")
+            message = (_("Export annulé : aucune image traitée.") if cancelled
+                       else _("Aucune image à traiter."))
             self._show_message(Gtk.MessageType.INFO, _("Export"), message)
             return
 
         lines = [f"{succeeded}/{total} image(s) exportée(s) avec succès."]
+        if cancelled:
+            remaining = max(0, self._image_count - total)
+            lines.append(_("Export interrompu — {n} image(s) non traitée(s).")
+                         .format(n=remaining))
         if failed:
             lines.append("")
             lines.append(_("Échecs :"))
@@ -588,7 +756,8 @@ class WatermarkDialog:
                 lines.append(f"  • {res.image_name} : {res.error_message}")
 
         msg_type = Gtk.MessageType.INFO if not failed else Gtk.MessageType.WARNING
-        self._show_message(msg_type, _("Export terminé"), "\n".join(lines))
+        title = _("Export annulé") if cancelled else _("Export terminé")
+        self._show_message(msg_type, title, "\n".join(lines))
 
     def _show_message(self, msg_type: Gtk.MessageType, title: str, body: str) -> None:
         """Affiche une boîte de dialogue modale d'information/erreur."""

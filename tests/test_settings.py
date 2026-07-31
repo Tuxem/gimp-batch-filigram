@@ -62,6 +62,26 @@ class TestSettingsSerialization(unittest.TestCase):
         settings = Settings.from_dict({"opacity": "not-a-number"})
         self.assertEqual(settings.opacity, Settings().opacity)
 
+    def test_load_settings_predating_load_options(self):
+        # Un fichier écrit par une version antérieure ne contient aucun réglage
+        # de charge machine : les défauts doivent s'appliquer.
+        settings = Settings.from_dict({"opacity": 50})
+        self.assertEqual(settings.limit_cpu, Settings().limit_cpu)
+        self.assertEqual(settings.cpu_reserve, Settings().cpu_reserve)
+        self.assertEqual(settings.throttle_ms, Settings().throttle_ms)
+
+    def test_load_options_roundtrip(self):
+        original = Settings()
+        original.limit_cpu = False
+        original.cpu_reserve = 4
+        original.throttle_ms = 250
+
+        restored = Settings.from_dict(original.to_dict())
+
+        self.assertIs(restored.limit_cpu, False)
+        self.assertEqual(restored.cpu_reserve, 4)
+        self.assertEqual(restored.throttle_ms, 250)
+
 
 class TestSettingsManager(unittest.TestCase):
     def test_save_then_load(self):

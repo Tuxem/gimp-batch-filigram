@@ -96,6 +96,11 @@ class Settings:
     skip_unmodified: bool = False            #: Ignorer les images non modifiées.
     debug: bool = False                      #: Activer les logs DEBUG.
 
+    # --- Charge machine (voir :mod:`lib.perf`) ---------------------------
+    limit_cpu: bool = C.CPU_LIMIT_DEFAULT    #: Brider GEGL pendant l'export.
+    cpu_reserve: int = C.CPU_RESERVE_DEFAULT  #: Cœurs laissés libres si bridage.
+    throttle_ms: int = C.THROTTLE_MS_DEFAULT  #: Pause entre deux images (ms).
+
     # ------------------------------------------------------------------ #
     # Sérialisation
     # ------------------------------------------------------------------ #

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 import gi
 
@@ -30,6 +30,7 @@ from . import constants as C  # noqa: E402
 from . import utils  # noqa: E402
 from .constants import ExportFormat  # noqa: E402
 from .logger import get_logger  # noqa: E402
+from .perf import limited_resources  # noqa: E402
 from .settings import Settings  # noqa: E402
 from .watermark import WatermarkError, WatermarkRenderer  # noqa: E402
 
@@ -37,6 +38,11 @@ _log = get_logger("exporter")
 
 #: Signature d'un rappel de progression : ``(courant, total, nom, statut)``.
 ProgressCallback = Callable[[int, int, str, str], None]
+
+#: Signature d'un rappel d'étape, invoqué **pendant** le traitement d'une image
+#: (ex. ``"filigrane"``). Il permet à l'appelant de rendre la main à sa boucle
+#: d'événements entre deux opérations coûteuses.
+StageCallback = Callable[[str], None]
 
 
 class ExportError(Exception):
@@ -77,6 +83,9 @@ class BaseFormatExporter:
     #: Format géré par l'exporteur (redéfini par les sous-classes).
     format: ExportFormat = None  # type: ignore[assignment]
 
+    #: Noms de procédure PDB candidats, du plus récent au plus ancien.
+    procedures: tuple[str, ...] = ()
+
     def export(self, image: Gimp.Image, path: str, settings: Settings) -> None:
         """Écrit ``image`` vers ``path``.
 
@@ -105,21 +114,41 @@ class BaseFormatExporter:
 
     # -- utilitaire commun d'appel de procédure PDB -----------------------
     @staticmethod
-    def _run_pdb_export(proc_name: str, image: Gimp.Image, gio_file: Gio.File,
-                        extra_props: dict) -> None:
+    def _lookup_procedure(proc_names: tuple[str, ...]):
+        """Retourne la première procédure PDB existante parmi ``proc_names``.
+
+        GIMP 3 a renommé les procédures d'écriture de fichier : le suffixe
+        ``-save`` de GIMP 2 est devenu ``-export`` (``file-png-save`` →
+        ``file-png-export``). On essaie donc plusieurs noms, du plus récent au
+        plus ancien, plutôt que d'échouer — et de retomber en silence sur un
+        repli qui ignore les réglages de qualité/compression.
+
+        :return: le couple ``(nom, procédure)``.
+        :raises ExportError: si aucun des noms n'existe.
+        """
+        pdb = Gimp.get_pdb()
+        for name in proc_names:
+            proc = pdb.lookup_procedure(name)
+            if proc is not None:
+                return name, proc
+        raise ExportError(
+            "Procédure d'export introuvable (essayé : " + ", ".join(proc_names) + ")")
+
+    @classmethod
+    def _run_pdb_export(cls, proc_names: tuple[str, ...], image: Gimp.Image,
+                        gio_file: Gio.File, extra_props: dict) -> None:
         """Exécute une procédure d'export PDB avec une configuration donnée.
 
-        :param proc_name: nom de la procédure (ex. ``"file-png-save"``).
+        :param proc_names: noms candidats de la procédure, par ordre de
+            préférence (ex. ``("file-png-export", "file-png-save")``).
         :param extra_props: propriétés spécifiques au format (qualité…).
-        :raises ExportError: si la procédure est absente ou renvoie un échec.
+        :raises ExportError: si aucune procédure n'existe ou si l'appel échoue.
 
         Chaque affectation de propriété est protégée : une propriété inconnue
         (nom changé selon la version de GIMP) est ignorée sans interrompre
         l'export, ce qui rend le code tolérant aux évolutions de l'API.
         """
-        proc = Gimp.get_pdb().lookup_procedure(proc_name)
-        if proc is None:
-            raise ExportError(f"Procédure d'export introuvable : {proc_name}")
+        proc_name, proc = cls._lookup_procedure(proc_names)
 
         config = proc.create_config()
 
@@ -144,12 +173,19 @@ class BaseFormatExporter:
 
 
 class PngExporter(BaseFormatExporter):
-    """Exporteur PNG (sans perte, transparence conservée)."""
+    """Exporteur PNG (sans perte, transparence conservée).
+
+    Le niveau de compression est le principal levier sur la durée d'un export
+    PNG : à qualité d'image identique (le PNG est sans perte), passer de 9 à 3
+    divise sensiblement le temps d'écriture pour quelques pour-cent de taille
+    en plus.
+    """
 
     format = ExportFormat.PNG
+    procedures = ("file-png-export", "file-png-save")
 
     def _export_native(self, image, gio_file, settings):
-        self._run_pdb_export("file-png-save", image, gio_file, {
+        self._run_pdb_export(self.procedures, image, gio_file, {
             "compression": int(utils.clamp(settings.png_compression, 0, 9)),
         })
 
@@ -158,11 +194,12 @@ class JpegExporter(BaseFormatExporter):
     """Exporteur JPEG (avec réglage de qualité)."""
 
     format = ExportFormat.JPG
+    procedures = ("file-jpeg-export", "file-jpeg-save")
 
     def _export_native(self, image, gio_file, settings):
         # La qualité JPEG de la PDB GIMP 3 est un flottant 0.0–1.0.
         quality = utils.clamp(settings.jpeg_quality, 0, 100) / 100.0
-        self._run_pdb_export("file-jpeg-save", image, gio_file, {
+        self._run_pdb_export(self.procedures, image, gio_file, {
             "quality": quality,
         })
 
@@ -171,10 +208,11 @@ class WebpExporter(BaseFormatExporter):
     """Exporteur WebP (qualité + transparence)."""
 
     format = ExportFormat.WEBP
+    procedures = ("file-webp-export", "file-webp-save")
 
     def _export_native(self, image, gio_file, settings):
         # La qualité WebP de la PDB GIMP 3 est un flottant 0–100.
-        self._run_pdb_export("file-webp-save", image, gio_file, {
+        self._run_pdb_export(self.procedures, image, gio_file, {
             "quality": float(utils.clamp(settings.jpeg_quality, 0, 100)),
             "lossless": False,
         })
@@ -219,6 +257,14 @@ class BatchExporter:
     dupliquée, filigranée sur la copie, exportée, puis la copie est détruite.
     Toute erreur sur une image est capturée et consignée dans un
     :class:`ExportResult`, sans jamais interrompre le traitement du lot.
+
+    Le traitement s'expose sous deux formes :
+
+    * :meth:`iter_export` — un **générateur** qui rend la main après chaque
+      image. C'est la forme à privilégier depuis une interface graphique : elle
+      permet à l'appelant de repasser dans sa boucle d'événements entre deux
+      images, donc de rester réactif (voir :mod:`lib.ui`) et d'annuler le lot ;
+    * :meth:`export_all` — la forme bloquante, pratique en mode non interactif.
     """
 
     def __init__(self, settings: Settings,
@@ -230,56 +276,100 @@ class BatchExporter:
         self._supports_alpha = C.FORMAT_SUPPORTS_ALPHA[settings.export_format]
 
     # ------------------------------------------------------------------ #
-    def export_all(self, progress_callback: Optional[ProgressCallback] = None) -> list[ExportResult]:
-        """Exporte toutes les images ouvertes et retourne les résultats.
+    def iter_export(self, progress_callback: Optional[ProgressCallback] = None,
+                    stage_callback: Optional[StageCallback] = None,
+                    ) -> Iterator[ExportResult]:
+        """Exporte les images ouvertes **une par une**, en rendant la main.
 
         :param progress_callback: rappel invoqué après chaque image, avec
             ``(index_courant, total, nom_image, statut)``.
-        :return: liste des :class:`ExportResult`, un par image traitée.
+        :param stage_callback: rappel invoqué entre les étapes coûteuses d'une
+            même image (duplication, filigrane, fusion, écriture). Il donne à
+            une interface graphique l'occasion de traiter ses événements au
+            milieu d'une image lourde, et pas seulement entre deux images.
+        :yield: un :class:`ExportResult` par image traitée.
+
+        Le lot tourne sous :func:`lib.perf.limited_resources` : le parallélisme
+        de GEGL est bridé selon les préférences, puis restauré à la fin — y
+        compris si l'appelant ferme le générateur avant la fin (annulation).
         """
         images = list_open_images()
         total = len(images)
-        results: list[ExportResult] = []
         date_str = utils.today_string()
+        succeeded = 0
+        processed = 0
 
         _log.info("Début de l'export : %d image(s) ouverte(s).", total)
         Gimp.progress_init(f"{C.PLUGIN_TITLE} : 0/{total}")
 
-        for index, image in enumerate(images, start=1):
-            name = self._image_display_name(image)
+        try:
+            with limited_resources(self._settings.limit_cpu,
+                                   self._settings.cpu_reserve):
+                for index, image in enumerate(images, start=1):
+                    name = self._image_display_name(image)
 
-            # Option : ignorer les images non modifiées.
-            if self._settings.skip_unmodified and not image.is_dirty():
-                _log.info("Image « %s » ignorée (non modifiée).", name)
-                results.append(ExportResult(name, None, True, "Ignorée (non modifiée)"))
-                self._report(progress_callback, index, total, name, "ignorée")
-                continue
+                    # Option : ignorer les images non modifiées.
+                    if self._settings.skip_unmodified and not image.is_dirty():
+                        _log.info("Image « %s » ignorée (non modifiée).", name)
+                        result = ExportResult(name, None, True, "Ignorée (non modifiée)")
+                        self._report(progress_callback, index, total, name, "ignorée")
+                    else:
+                        result = self._process_one(image, name, date_str, stage_callback)
+                        self._report(progress_callback, index, total, name,
+                                     "ok" if result.success else "erreur")
 
-            result = self._process_one(image, name, date_str)
-            results.append(result)
-            self._report(progress_callback, index, total, name,
-                         "ok" if result.success else "erreur")
+                    processed += 1
+                    succeeded += 1 if result.success else 0
+                    yield result
+        finally:
+            # Exécuté aussi bien à la fin normale qu'en cas d'annulation
+            # (fermeture du générateur) : la barre de progression de GIMP ne
+            # doit jamais rester active.
+            try:
+                Gimp.progress_end()
+            except Exception:  # noqa: BLE001 - la progression ne doit jamais bloquer.
+                pass
+            _log.info("Export terminé : %d/%d réussi(s) sur %d image(s) ouverte(s).",
+                      succeeded, processed, total)
 
-        Gimp.progress_end()
-        succeeded = sum(1 for r in results if r.success)
-        _log.info("Export terminé : %d/%d réussi(s).", succeeded, total)
-        return results
+    def export_all(self, progress_callback: Optional[ProgressCallback] = None,
+                   stage_callback: Optional[StageCallback] = None,
+                   ) -> list[ExportResult]:
+        """Variante bloquante de :meth:`iter_export` (mode non interactif).
+
+        :return: liste des :class:`ExportResult`, un par image traitée.
+        """
+        return list(self.iter_export(progress_callback, stage_callback))
 
     # ------------------------------------------------------------------ #
-    def _process_one(self, image: Gimp.Image, name: str, date_str: str) -> ExportResult:
+    def _process_one(self, image: Gimp.Image, name: str, date_str: str,
+                     stage_callback: Optional[StageCallback] = None) -> ExportResult:
         """Traite une image unique et retourne son résultat.
 
         Toutes les exceptions sont capturées : une image en échec n'empêche
         jamais le traitement des suivantes.
         """
         duplicate = None
+
+        def stage(label: str) -> None:
+            """Signale une étape à l'appelant (jamais bloquant, jamais fatal)."""
+            if stage_callback is None:
+                return
+            try:
+                stage_callback(label)
+            except Exception:  # noqa: BLE001 - un rappel fautif ne casse pas l'export.
+                _log.debug("Rappel d'étape en erreur (%s) — ignoré.", label)
+
         try:
+            stage("duplication")
             duplicate = image.duplicate()
 
             # 1. Application du filigrane sur la copie.
+            stage("filigrane")
             self._renderer.apply(duplicate, self._settings)
 
             # 2. Fusion/aplatissement selon la prise en charge de l'alpha.
+            stage("fusion")
             if self._supports_alpha:
                 duplicate.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
             else:
@@ -303,7 +393,9 @@ class BatchExporter:
                 out_dir, stem, self._extension, self._settings.overwrite,
             )
 
-            # 4. Export.
+            # 4. Export. Dernière occasion de rendre la main : l'écriture du
+            #    fichier est une opération PDB atomique, non interruptible.
+            stage("écriture")
             self._exporter.export(duplicate, out_path, self._settings)
 
             _log.info("Image « %s » exportée vers %s", name, out_path)

@@ -201,6 +201,23 @@ MARGIN_DEFAULT: float = 20.0         #: 20 px de marge par défaut.
 JPEG_QUALITY_DEFAULT: int = 90       #: Qualité JPEG/WebP (0-100).
 PNG_COMPRESSION_DEFAULT: int = 6     #: Compression PNG (0-9).
 
+
+# ---------------------------------------------------------------------------
+# Maîtrise de la charge machine (voir :mod:`lib.perf`)
+# ---------------------------------------------------------------------------
+
+#: Brider GEGL pour laisser des cœurs libres pendant l'export.
+CPU_LIMIT_DEFAULT: bool = True
+
+#: Nombre de cœurs laissés à la machine quand le bridage est actif.
+CPU_RESERVE_DEFAULT: int = 1
+CPU_RESERVE_MAX: int = 32
+
+#: Pause (ms) rendue à la boucle GTK entre deux images. Une valeur non nulle
+#: laisse respirer l'interface et le reste du système sur les gros lots.
+THROTTLE_MS_DEFAULT: int = 50
+THROTTLE_MS_MAX: int = 5000
+
 #: Nom du sous-dossier créé automatiquement si l'option est activée.
 EXPORTS_SUBFOLDER_NAME: str = "exports"
 

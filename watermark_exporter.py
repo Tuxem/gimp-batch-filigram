@@ -133,8 +133,12 @@ class WatermarkExporter(Gimp.PlugIn):
 
         GimpUi.init(C.PROCEDURE_NAME)
 
-        def runner(current_settings, progress_callback):
-            return BatchExporter(current_settings).export_all(progress_callback)
+        def runner(current_settings, progress_callback, stage_callback):
+            # Forme *générateur* : le dialogue fait avancer l'export image par
+            # image depuis la boucle GTK, ce qui garde la fenêtre réactive
+            # (voir la note d'en-tête de lib.ui).
+            return BatchExporter(current_settings).iter_export(
+                progress_callback, stage_callback)
 
         dialog = WatermarkDialog(settings, manager, runner, len(images))
         dialog.run()

@@ -1,0 +1,7 @@
+# Octets compilés Python
+__pycache__/
+*.py[cod]
+
+# Outillage local de développement : contient l'adresse de la machine de test
+# personnelle, qui n'a pas à figurer dans le dépôt public.
+scripts/offload.sh

@@ -213,8 +213,29 @@ chmod +x "$DEST/watermark_exporter.py"
    - choisissez le **dossier de sortie** (ou « à côté de chaque original ») et
      l'option de sous-dossier `exports` ;
    - définissez la règle de **nommage** (préfixe, suffixe, date, motif) ;
+   - ajustez au besoin la section **Charge machine** (voir ci-dessous) ;
 5. Cliquez sur **Exporter**. La progression s'affiche et un résumé indique les
    éventuelles erreurs. Vos réglages sont mémorisés pour la prochaine fois.
+   Pendant le traitement, **Annuler** interrompt le lot après l'image en cours.
+
+### Charge machine
+
+Un lot de grandes images sature facilement le processeur : le moteur de GIMP
+(GEGL) parallélise sur tous les cœurs disponibles. Deux réglages, dans l'onglet
+**Export**, permettent de rendre la main au système :
+
+| Réglage                     | Défaut  | Effet                                                                 |
+|-----------------------------|---------|-----------------------------------------------------------------------|
+| **Brider le traitement**    | activé  | Limite le nombre de threads GEGL le temps de l'export.                |
+| **Cœurs laissés libres**    | 1       | Nombre de cœurs réservés au reste du système (au moins 1 thread reste attribué à l'export). |
+| **Pause entre images (ms)** | 50      | Temps rendu au système entre deux images d'un lot.                    |
+
+La configuration d'origine de GEGL est restaurée à la fin du lot, même en cas
+d'annulation ou d'erreur.
+
+Sur un export **PNG**, le levier le plus efficace sur la durée reste le niveau
+de **compression** (onglet Export) : le PNG étant sans perte, descendre de 9 à 3
+réduit nettement le temps d'écriture pour quelques pour-cent de taille en plus.
 
 ### Variables de nommage
 
@@ -243,6 +264,8 @@ Exemple : `{filename}_{width}x{height}` → `photo_640x480.png`.
 | Le filigrane texte utilise une autre police         | Le nom de police saisi est introuvable dans GIMP ; la police courante est utilisée. Vérifiez le nom exact dans _Fenêtres ▸ Fenêtres ancrables ▸ Polices_. |
 | L'ombre du texte n'est pas floutée                  | L'opération GEGL de flou est indisponible dans votre build ; l'ombre reste nette (comportement dégradé volontaire). |
 | Rien ne s'exporte                                   | Vérifiez le dossier de sortie et les droits d'écriture ; consultez le journal (voir ci-dessous). |
+| « Le script ne répond pas » pendant un long export  | L'interface reste vivante depuis la version non publiée (export découpé image par image). Si le message persiste, augmentez la **pause entre images** et vérifiez que le **bridage** est activé (section _Charge machine_). |
+| L'export mobilise toute la machine                  | Section _Charge machine_ : augmentez les **cœurs laissés libres** et la **pause entre images**. Sur un lot PNG, baissez aussi la **compression**. |
 | Où sont les journaux ?                              | Dans `<dossier GIMP>/watermark-exporter/watermark-exporter.log`. Activez le **mode debug** dans l'onglet Export pour plus de détails. |
 
 Le **dossier GIMP** est indiqué par la console Python-Fu :
@@ -293,21 +316,37 @@ lib/
     logger.py             Configuration de la journalisation.
     watermark.py          Rendu du filigrane (image/texte) — API GIMP.
     exporter.py           Moteur d'export par lot + registre de formats.
+    perf.py               Bridage réversible de la charge machine (GEGL).
     ui.py                 Interface GTK 3 (GimpUi).
 resources/icon.svg        Icône du plugin.
-tests/                    Tests unitaires (logique pure).
+tests/                    Tests unitaires (logique pure) + test de fumée GIMP.
 locale/                   Emplacement des futurs catalogues de traduction.
 ```
 
 ### Lancer les tests
 
-Les tests ne nécessitent **pas** GIMP (ils ne couvrent que la logique pure) :
+Les tests unitaires ne nécessitent **pas** GIMP (ils ne couvrent que la logique
+pure) :
 
 ```bash
 python3 -m unittest discover -s tests -v
 # ou, si pytest est installé :
 python3 -m pytest tests -v
 ```
+
+Le **test de fumée** (`tests/smoke_gimp.py`) vérifie ce qui n'a de sens que face
+au vrai runtime : pipeline complet, procédures d'export natives, effet réel du
+réglage de compression, bridage GEGL et annulation en cours de lot. Il s'exécute
+dans GIMP, sans interface :
+
+```bash
+gimp -i -s --batch-interpreter python-fu-eval \
+     -b "exec(open('$PWD/tests/smoke_gimp.py').read())" --quit
+```
+
+`--quit` est indispensable : sans lui, GIMP reste en vie après les commandes
+batch. Le code de retour n'étant pas propagé par GIMP, le script écrit son
+verdict (`0` ou `1`) dans le fichier désigné par `SMOKE_VERDICT_FILE`.
 
 ### Vérifier la syntaxe et les imports
 
